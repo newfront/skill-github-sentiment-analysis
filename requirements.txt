@@ -1,0 +1,21 @@
+# Core — GitHub issue fetching (already required)
+# gh CLI must be installed separately: brew install gh
+
+# Environment — load .env file automatically
+python-dotenv>=1.0.0
+
+# Sentiment — VADER offline scoring
+vaderSentiment==3.3.2
+
+# Sentiment — MLflow tracing
+mlflow>=3.8.0
+
+# Sentiment — LLM providers (install whichever you use)
+# OpenAI (default)
+openai>=2.0.0
+
+# Anthropic (optional — set LLM_PROVIDER=anthropic)
+# anthropic>=0.84.0
+
+# Databricks (optional — set LLM_PROVIDER=databricks, uses openai SDK against serving endpoints)
+# No extra package needed beyond openai>=2.0.0

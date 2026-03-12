@@ -11,9 +11,16 @@ Usage (flags):
         --limit N          Number of issues to fetch (default: 20)
         --body             Include full issue body/description
         --related          Fetch related open PRs and branches per issue
+        --sentiment        Run hybrid VADER + LLM sentiment analysis on each issue
         --output           markdown | json  (default: markdown)
         --state            open | closed | all (default: open)
         --export FILE      Write output to file
+
+    Sentiment env vars:
+        LLM_PROVIDER       openai | anthropic | databricks  (default: openai)
+        LLM_MODEL          Model name override
+        MLFLOW_TRACKING_URI     MLflow server for tracing (optional)
+        MLFLOW_EXPERIMENT_NAME  Experiment to log traces under (optional)
 
 Usage (interactive):
     python gh_issues.py --interactive
@@ -22,10 +29,17 @@ Usage (interactive):
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
 from typing import Optional
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # python-dotenv not installed — env vars must be set manually
 
 
 def run_gh(args: list[str]) -> list | dict:
@@ -48,9 +62,10 @@ def parse_repo(repo_input: str) -> str:
     raise ValueError(f"Cannot parse repo from: {repo_input!r}")
 
 
-def fetch_issues(repo: str, limit: int, include_body: bool, state: str) -> list:
+def fetch_issues(repo: str, limit: int, include_body: bool, state: str, sentiment: bool = False) -> list:
     fields = ["number", "title", "state", "createdAt", "author", "labels", "url"]
-    if include_body:
+    if include_body or sentiment:
+        # sentiment always needs body + title to produce a meaningful analysis
         fields += ["body", "comments"]
     return run_gh([
         "issue", "list",
@@ -127,6 +142,23 @@ def format_markdown(
             lines.append("**Description:**")
             lines.append(f"> {body.replace(chr(10), chr(10) + '> ')}\n")
 
+        sentiment = issue.get("sentiment")
+        if sentiment:
+            score = sentiment["vader_score"]
+            tone = sentiment["tone_label"]
+            detail = sentiment.get("tone_detail", "")
+            summary = sentiment.get("summary", "")
+            provider = sentiment.get("llm_provider", "")
+            tone_display = f"{tone}" + (f" — {detail}" if detail else "")
+            lines.append("**Sentiment:**")
+            lines.append(f"- Tone: `{tone_display}`")
+            lines.append(f"- VADER score: `{score:+.4f}`")
+            if summary:
+                lines.append(f"- Summary: {summary}")
+            if provider:
+                lines.append(f"- _(via {provider})_")
+            lines.append("")
+
         if include_related:
             prs = fetch_related_prs(repo, issue["number"])
             branches = fetch_related_branches(repo, issue["number"])
@@ -160,13 +192,28 @@ def interactive_mode() -> tuple:
 
     include_body = input("Include full issue description? [y/N]: ").strip().lower() == "y"
     include_related = input("Fetch related PRs and branches? [y/N]: ").strip().lower() == "y"
+    run_sentiment = input("Run sentiment analysis? [y/N]: ").strip().lower() == "y"
 
     raw_fmt = input("Output format — markdown / json [markdown]: ").strip().lower()
     output_format = raw_fmt if raw_fmt in ("json", "markdown") else "markdown"
 
     export_file = input("Export to file? Enter path or leave blank: ").strip() or None
 
-    return repo, limit, state, include_body, include_related, output_format, export_file
+    return repo, limit, state, include_body, include_related, run_sentiment, output_format, export_file
+
+
+def _setup_mlflow() -> None:
+    """Configure MLflow from env vars if set; silently skip if mlflow not installed."""
+    try:
+        import mlflow  # noqa: F401 — already imported at module level in sentiment.py
+        tracking_uri = os.environ.get("MLFLOW_TRACKING_URI")
+        experiment_name = os.environ.get("MLFLOW_EXPERIMENT_NAME", "gh-issues-sentiment")
+        if tracking_uri:
+            mlflow.set_tracking_uri(tracking_uri)
+        if not os.environ.get("MLFLOW_EXPERIMENT_ID"):
+            mlflow.set_experiment(experiment_name)
+    except ImportError:
+        pass
 
 
 def main():
@@ -177,6 +224,7 @@ def main():
     parser.add_argument("--limit", type=int, default=20, help="Number of issues (default: 20)")
     parser.add_argument("--body", action="store_true", help="Include issue body/description")
     parser.add_argument("--related", action="store_true", help="Fetch related PRs and branches")
+    parser.add_argument("--sentiment", action="store_true", help="Run hybrid sentiment analysis")
     parser.add_argument("--output", choices=["markdown", "json"], default="markdown")
     parser.add_argument("--state", choices=["open", "closed", "all"], default="open")
     parser.add_argument("--export", metavar="FILE", help="Write output to a file")
@@ -185,7 +233,7 @@ def main():
     args = parser.parse_args()
 
     if args.interactive or not args.repo:
-        repo, limit, state, include_body, include_related, output_format, export_file = (
+        repo, limit, state, include_body, include_related, run_sentiment, output_format, export_file = (
             interactive_mode()
         )
     else:
@@ -194,16 +242,32 @@ def main():
         state = args.state
         include_body = args.body
         include_related = args.related
+        run_sentiment = args.sentiment
         output_format = args.output
         export_file = args.export
 
     print(f"\nFetching {limit} {state} issues from {repo}...\n", file=sys.stderr)
 
     try:
-        issues = fetch_issues(repo, limit, include_body, state)
+        issues = fetch_issues(repo, limit, include_body, state, sentiment=run_sentiment)
     except subprocess.CalledProcessError as e:
         print(f"Error: gh CLI failed — {e.stderr.strip()}", file=sys.stderr)
         sys.exit(1)
+
+    if run_sentiment:
+        try:
+            from sentiment import analyze_issues  # noqa: PLC0415
+        except ImportError as e:
+            print(
+                f"Error: sentiment dependencies not installed — {e}\n"
+                "Run: pip install vaderSentiment mlflow openai",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        _setup_mlflow()
+        print("Running sentiment analysis...\n", file=sys.stderr)
+        issues = analyze_issues(issues)
 
     if output_format == "json":
         output = json.dumps(issues, indent=2)
